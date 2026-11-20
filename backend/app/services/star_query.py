@@ -4,12 +4,15 @@
 - 消费 fact.published 和 dim.published 通道校验查询组件
 - 自动校验关联维度和度量是否可用
 - 星型查询SQL生成（SELECT/FROM/JOIN/WHERE/GROUP BY）
+- 按汇总刷新版本执行查询：只取已确认版本的聚合度量，返回与金额
+  持久化记录一致的事实分区，未确认金额不进入查询结果
 - 查询结果限制与分页建议
 """
 from __future__ import annotations
 
 from typing import Any
 
+from app.services.agg_refresh import agg_refresh_engine
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -94,6 +97,45 @@ class StarQueryService(BaseModuleService):
                 "entry_id": entry_id,
             })
         return entry, message
+
+    def execute_query(self, entry_id: int, filters: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, str]:
+        """按汇总刷新版本执行星型查询：只取已确认版本的聚合度量。
+
+        返回与金额持久化记录一致的事实分区；尚未确认的金额不进入查询结果。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+
+        fact_name = str(entry.get("事实表", "")).strip()
+        group_dims = {
+            d.strip()
+            for d in str(entry.get("分组维度", "")).replace(",", ".").split(".")
+            if d.strip()
+        }
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for agg in store.rows("agg_summary"):
+            if str(agg.get("源事实表", "")).strip() != fact_name:
+                continue
+            if agg_refresh_engine.current_version(int(agg["id"])) is None:
+                continue  # 该汇总尚无已确认版本，未确认金额不进入查询结果
+            agg_dims = {d.strip() for d in str(agg.get("汇总维度", "")).split(".") if d.strip()}
+            candidates.append((len(group_dims & agg_dims), agg))
+        if not candidates:
+            return None, f"事实表 {fact_name} 尚无已确认的汇总刷新版本，未确认金额不进入查询结果"
+
+        candidates.sort(key=lambda c: (-c[0], int(c[1]["id"])))
+        agg = candidates[0][1]
+        result = agg_refresh_engine.query_aggregate(int(agg["id"]), filters)
+        result["查询名称"] = entry.get("查询名称")
+        result["命中汇总"] = agg.get("汇总名称")
+        store.channel.publish("query.executed", {
+            "query_name": entry.get("查询名称"),
+            "agg_name": agg.get("汇总名称"),
+            "version_id": result.get("version_id"),
+            "entry_id": entry_id,
+        })
+        return result, f"查询已按汇总刷新版本 {result.get('version_id')} 执行"
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()

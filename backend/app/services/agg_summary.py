@@ -4,14 +4,16 @@
 - 消费 fact.published 和 measure.ready 通道，获取事实和度量信息
 - 消费 agg.suggested 通道自动创建建议汇总
 - 汇总粒度上卷验证：汇总维度必须是源事实表关联维度的子集
-- 增量标记管理：基于已刷新记录的metadata确定增量边界
+- 版本化刷新：执行构建/刷新汇总由汇总刷新版本引擎驱动，参与聚合的
+  源分区与产出金额写入汇总刷新版本，供星型查询复算
+- 刷新未完成时保留上次成功汇总（最近一次已确认版本继续生效）
 - 构建失败自动记录追踪
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
+from app.services.agg_refresh import AggRefreshError, agg_refresh_engine
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -88,57 +90,84 @@ class AggSummaryService(BaseModuleService):
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry, message = super().run_action(entry_id, action)
+        entry = store.find(self.MODULE, entry_id)
         if entry is None:
-            return None, message
-
-        fact_name = entry.get("源事实表", "")
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if action not in self.ACTION_RULES:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
 
         if action == "执行构建":
-            # 模拟汇总构建过程
-            build_result = _simulate_agg_build(entry)
-            if build_result["success"]:
-                entry["status"] = "已构建"
-                entry["pending"] = True
-                store.channel.publish("agg.built", {
-                    "agg_name": entry["汇总名称"],
-                    "source_fact": fact_name,
-                    "row_count": build_result.get("output_rows", 0),
-                    "build_time": datetime.now(timezone.utc).isoformat(),
-                    "incremental": entry.get("增量标记") == "是",
-                    "entry_id": entry_id,
-                })
-            else:
-                entry["status"] = "构建失败"
-                entry["pending"] = True
-                entry["abnormal"] = True
-                store.channel.publish("agg.build_failed", {
-                    "agg_name": entry["汇总名称"],
-                    "error": build_result.get("error", ""),
-                    "entry_id": entry_id,
-                })
-                # 记录失败到恢复管理器
-                store.recovery.log_retry(
-                    "agg_summary", f"build_{entry_id}", 1,
-                    build_result.get("error", "未知错误"), False
-                )
+            return self._run_build(entry)
+        return self._run_refresh(entry)
 
-        elif action == "刷新汇总":
-            # 增量刷新
-            refresh_result = _simulate_agg_refresh(entry)
-            if refresh_result["success"]:
-                entry["status"] = "已刷新"
-                entry["pending"] = False
-                store.channel.publish("agg.refreshed", {
-                    "agg_name": entry["汇总名称"],
-                    "new_rows": refresh_result.get("new_rows", 0),
-                    "refresh_time": datetime.now(timezone.utc).isoformat(),
-                    "entry_id": entry_id,
-                })
-            else:
-                entry["pending"] = True
-                entry["abnormal"] = True
+    def _run_build(self, entry: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """执行构建：全量刷新并提交一个汇总刷新版本。"""
+        try:
+            version = agg_refresh_engine.refresh(entry["id"])
+        except AggRefreshError as exc:
+            entry["status"] = "构建失败"
+            entry["pending"] = True
+            entry["abnormal"] = True
+            store.channel.publish("agg.build_failed", {
+                "agg_name": entry.get("汇总名称"),
+                "error": exc.message,
+                "entry_id": entry["id"],
+            })
+            store.recovery.log_retry("agg_summary", f"build_{entry['id']}", 1, exc.message, False)
+            return entry, f"汇总构建失败：{exc.message}"
 
+        entry["status"] = "已构建"
+        entry["pending"] = True
+        entry["abnormal"] = False
+        store.channel.publish("agg.built", {
+            "agg_name": entry.get("汇总名称"),
+            "source_fact": entry.get("源事实表"),
+            "row_count": len(version["items"]),
+            "version_id": version["version_id"],
+            "total_amount": version["total_amount"],
+            "build_time": version["committed_at"],
+            "incremental": entry.get("增量标记") == "是",
+            "entry_id": entry["id"],
+        })
+        return entry, (
+            f"汇总表已执行构建，刷新版本 {version['version_id']} 已确认，"
+            f"计入 {len(version['items'])} 个源分区"
+        )
+
+    def _run_refresh(self, entry: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """刷新汇总：增量分区重算 + 未变更分区继承，提交新的汇总刷新版本。"""
+        try:
+            version = agg_refresh_engine.refresh(entry["id"])
+        except AggRefreshError as exc:
+            # 刷新未完成：保留上次成功汇总（最近已确认版本继续生效），状态不推进
+            entry["pending"] = True
+            entry["abnormal"] = True
+            store.recovery.log_retry("agg_summary", f"refresh_{entry['id']}", 1, exc.message, False)
+            store.channel.publish("agg.refresh_failed", {
+                "agg_name": entry.get("汇总名称"),
+                "error": exc.message,
+                "entry_id": entry["id"],
+            })
+            return entry, f"刷新未完成，已保留上次成功汇总：{exc.message}"
+
+        entry["status"] = "已刷新"
+        entry["pending"] = False
+        entry["abnormal"] = False
+        store.channel.publish("agg.refreshed", {
+            "agg_name": entry.get("汇总名称"),
+            "new_rows": len(version["processed_partitions"]),
+            "version_id": version["version_id"],
+            "total_amount": version["total_amount"],
+            "excluded_partitions": [i["分区键"] for i in version["excluded"]],
+            "refresh_time": version["committed_at"],
+            "entry_id": entry["id"],
+        })
+        message = (
+            f"汇总表已刷新汇总，版本 {version['version_id']} 计入 "
+            f"{len(version['items'])} 个源分区"
+        )
+        if version["excluded"]:
+            message += f"，剔除失效分区 {len(version['excluded'])} 个"
         return entry, message
 
     def domain_snapshot(self) -> dict[str, Any]:
@@ -158,6 +187,10 @@ class AggSummaryService(BaseModuleService):
                 build_stats["pending"] += 1
         base["granularity_distribution"] = granularity_dist
         base["build_stats"] = build_stats
+        base["refresh_versions"] = {
+            state: sum(1 for v in store.agg_refresh_versions if v["state"] == state)
+            for state in ("已确认", "构建中", "已失败")
+        }
         base["consumed_facts"] = len(store.channel.consume("fact.published", "agg_summary"))
         base["consumed_measures"] = len(store.channel.consume("measure.ready", "agg_summary"))
         return base
@@ -178,29 +211,3 @@ def _validate_agg_dims(values: dict[str, Any]) -> None:
             if extra:
                 values["汇总维度"] = ".".join(sorted(agg_dim_set & fact_dims))
             break
-
-
-def _simulate_agg_build(entry: dict[str, Any]) -> dict[str, Any]:
-    """模拟汇总构建过程。"""
-    agg_dims = str(entry.get("汇总维度", "")).strip()
-    agg_measures = str(entry.get("汇总度量", "")).strip()
-
-    if not agg_dims or not agg_measures:
-        return {"success": False, "error": "汇总维度或度量未配置"}
-
-    dim_count = len([d for d in agg_dims.split(".") if d.strip()])
-    measure_count = len([m for m in agg_measures.split(".") if m.strip()])
-    estimated_rows = 100 * dim_count * measure_count
-    cp_id = store.recovery.create_checkpoint("agg_summary", f"build_{entry.get('id')}", {
-        "agg_name": entry.get("汇总名称"),
-        "phase": "build_started",
-        "dims_count": dim_count,
-        "measures_count": measure_count,
-    })
-    store.recovery.mark_completed(cp_id)
-    return {"success": True, "output_rows": estimated_rows, "checkpoint": cp_id}
-
-
-def _simulate_agg_refresh(entry: dict[str, Any]) -> dict[str, Any]:
-    """模拟汇总增量刷新过程。"""
-    return {"success": True, "new_rows": 50, "refreshed_at": datetime.now(timezone.utc).isoformat()}

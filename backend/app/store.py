@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import SEED_FACT_PARTITIONS, SEED_ROWS
 
 
 class DataChannel:
@@ -321,6 +321,9 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 源事实分区与汇总刷新版本：由汇总刷新引擎维护，不计入业务模块清单
+        self.fact_partitions: list[dict[str, Any]] = [dict(p) for p in SEED_FACT_PARTITIONS]
+        self.agg_refresh_versions: list[dict[str, Any]] = []
         self.channel = DataChannel()
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()

@@ -79,5 +79,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 汇总刷新版本
+
+`backend/app/services/agg_refresh.py` 提供版本化刷新引擎，`agg_summary` 的
+「执行构建 / 刷新汇总」动作由其驱动：
+
+- 每次刷新产生一个**汇总刷新版本**，写入参与聚合的源分区与产出金额，供星型查询复算；
+- 同一源分区的销售额只计入一次（未变更分区整体继承、重算分区按键去重）；
+- 版本提交时逐个校验源分区，被撤销/已更正的分区剔除留痕，已确认版本始终
+  完整对应一个可复算的源分区集合；
+- 刷新未完成（构建中/已失败）时保留上次成功汇总，未确认金额不进入查询结果；
+- 构建进度按源事实表和分区可追查（已处理/待处理分区清单）。
+
+版本接口挂在 `/api/agg-refresh`（`backend/app/routers/agg_refresh.py`）：
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/agg-refresh/partitions` | 源事实分区清单（可按源事实表过滤） |
+| `POST /api/agg-refresh/partitions/correct` | 源表更正：更新金额并推进数据版本 |
+| `POST /api/agg-refresh/partitions/revoke` | 源表撤销：分区置为已撤销 |
+| `POST /api/agg-refresh/{entry_id}/versions` | 开启构建中版本 |
+| `POST /api/agg-refresh/versions/{version_id}/process` | 处理待算分区 |
+| `POST /api/agg-refresh/versions/{version_id}/commit` | 校验并提交版本 |
+| `POST /api/agg-refresh/versions/{version_id}/fail` | 标记失败（保留上次成功汇总） |
+| `POST /api/agg-refresh/{entry_id}/refresh` | 一键刷新（开启+处理+提交） |
+| `GET /api/agg-refresh/{entry_id}/lineage` | 构建进度血缘（按源事实表+分区追查） |
+| `GET /api/agg-refresh/{entry_id}/result` | 按已确认版本查询，金额与分区逐项相加校对 |
+| `POST /api/agg-refresh/star-query/{query_id}/execute` | 星型查询按汇总刷新版本执行 |
+
 领域：数据工程
 子方向：数仓与数据湖
